@@ -46,10 +46,10 @@ async function run() {
 
   setStatus('<span class="loader"></span> Fetching transcript...');
 
-  // Step 2: Ask background.js to fetch transcript (bypasses Brave Shields)
+  // Step 2: Ask background.js to fetch transcript (captionUrl already extracted by content.js)
   const result = await new Promise(resolve => {
     chrome.runtime.sendMessage(
-      { action: "fetchTranscript", videoId: videoInfo.videoId },
+      { action: "fetchTranscript", videoId: videoInfo.videoId, captionUrl: videoInfo.captionUrl },
       res => resolve(res || { error: "No response from background." })
     );
   });
@@ -61,8 +61,8 @@ async function run() {
   }
 
   // Step 3: Save to storage and open relay page
-  const prompt = buildPrompt(result.title, result.transcript);
-  await chrome.storage.local.set({ yt_prompt: prompt, yt_title: result.title });
+  const prompt = buildPrompt(videoInfo.title, result.transcript);
+  await chrome.storage.local.set({ yt_prompt: prompt, yt_title: videoInfo.title });
 
   setStatus("✅ Done! Opening prompt page...", "success");
 
