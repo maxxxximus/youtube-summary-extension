@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "YouTube Summary → ChatGPT",
-  "version": "2.0",
+  "version": "2.1",
   "description": "Extract YouTube transcript and summarize with ChatGPT. Works in Chrome, Brave, Firefox.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
     "https://www.youtube.com/*",
-    "https://*.youtube.com/*"
+    "https://*.youtube.com/*",
+    "https://chatgpt.com/*"
   ],
   "action": {
     "default_popup": "popup.html"
@@ -18,6 +19,11 @@
     {
       "matches": ["https://www.youtube.com/*"],
       "js": ["content.js"]
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["chatgpt-inject.js"],
+      "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [

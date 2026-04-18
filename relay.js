@@ -32,19 +32,15 @@ btnCopy.addEventListener("click", async () => {
   }
 });
 
-// Open ChatGPT + auto-copy
+// Open ChatGPT — prompt auto-injects via chatgpt-inject.js
 btnChatGPT.addEventListener("click", async () => {
   const text = promptBox.value;
   if (!text) return;
 
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    promptBox.select();
-    document.execCommand("copy");
-  }
+  // Save prompt back to storage so chatgpt-inject.js picks it up
+  await chrome.storage.local.set({ yt_prompt: text });
 
-  showStatus("✅ Prompt copied! Paste in ChatGPT with ⌘+V / Ctrl+V");
+  showStatus("✅ Opening ChatGPT — prompt will auto-paste!");
   window.open("https://chatgpt.com/", "_blank");
 });
 
