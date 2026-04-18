@@ -9,12 +9,67 @@ async function getCurrentTab() {
   return tab;
 }
 
-// Runs in YouTube's MAIN world.
-// Intercepts the XHR that YouTube itself makes when loading CC subtitles —
-// that XHR has the signed pot= token attached by the player automatically.
-// We trigger the caption load via player.setOption(), capture the response,
-// then restore everything. This is the only reliable method because the pot
-// token is generated dynamically by YouTube's player scripts at request time.
+// ── History ───────────────────────────────────────────────────────────────────
+
+async function loadHistory() {
+  const { yt_history = [] } = await chrome.storage.local.get("yt_history");
+  return yt_history;
+}
+
+async function saveToHistory(videoId, title, transcript) {
+  const history = await loadHistory();
+  const entry = { videoId, title, transcript, date: new Date().toISOString() };
+  const updated = [entry, ...history.filter((h) => h.videoId !== videoId)].slice(0, 20);
+  await chrome.storage.local.set({ yt_history: updated });
+  renderHistory(updated);
+}
+
+function renderHistory(history) {
+  const list = document.getElementById("historyList");
+  if (!history.length) {
+    list.innerHTML = '<div class="history-empty">No transcripts yet</div>';
+    return;
+  }
+  list.innerHTML = history
+    .map(
+      (h, i) => `
+    <div class="history-item">
+      <div class="history-item-info">
+        <div class="history-title" title="${escHtml(h.title)}">${escHtml(h.title)}</div>
+        <div class="history-date">${formatDate(h.date)} · ${Math.round(h.transcript.length / 5)} words</div>
+      </div>
+      <button class="history-copy" data-idx="${i}">Copy</button>
+    </div>`
+    )
+    .join("");
+
+  list.querySelectorAll(".history-copy").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = parseInt(btn.dataset.idx);
+      const h = history[idx];
+      await navigator.clipboard.writeText(h.transcript);
+      btn.textContent = "✓ Copied";
+      btn.classList.add("copied");
+      setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("copied"); }, 1500);
+    });
+  });
+}
+
+function escHtml(str) {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function formatDate(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) +
+    " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+// ── MAIN world: XHR intercept ─────────────────────────────────────────────────
+
+// Runs in YouTube's MAIN world. Intercepts the XHR that YouTube makes when
+// loading CC — that request has the signed pot= token attached by the player.
+// We trigger caption load via player.setOption(), capture the full response.
 function fetchTranscriptViaXHRIntercept() {
   return new Promise((resolve) => {
     let done = false;
@@ -27,7 +82,6 @@ function fetchTranscriptViaXHRIntercept() {
       XMLHttpRequest.prototype.open = origOpen;
       XMLHttpRequest.prototype.send = origSend;
       clearTimeout(timer);
-      // Restore player CC state to what it was before
       try {
         const player = document.getElementById("movie_player");
         if (player) player.setOption("captions", "track", window.__ytExtPrevTrack || {});
@@ -37,7 +91,6 @@ function fetchTranscriptViaXHRIntercept() {
 
     const timer = setTimeout(() => finish({ error: "timeout" }), 12000);
 
-    // Intercept XHR — capture timedtext responses
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
       this._isTimedtext = typeof url === "string" && url.includes("/api/timedtext");
       return origOpen.apply(this, [method, url, ...rest]);
@@ -47,14 +100,20 @@ function fetchTranscriptViaXHRIntercept() {
       if (this._isTimedtext) {
         this.addEventListener("load", function () {
           const text = this.responseText;
-          if (!text || text.length < 100) return; // skip empty / tiny responses
+          if (!text || text.length < 100) return;
 
-          // JSON3 format (fmt=json3)
+          // JSON3 format — full video, all events in one response
           try {
             const data = JSON.parse(text);
             const transcript = (data.events || [])
               .filter((e) => e.segs)
-              .flatMap((e) => e.segs.map((s) => s.utf8 || ""))
+              .map((e) =>
+                e.segs
+                  .map((s) => (s.utf8 || "").replace(/\n/g, " "))
+                  .join("")
+                  .trim()
+              )
+              .filter(Boolean)
               .join(" ")
               .replace(/\s+/g, " ")
               .trim();
@@ -62,13 +121,14 @@ function fetchTranscriptViaXHRIntercept() {
           } catch (_) {}
 
           // XML format fallback
-          const xmlParts = text.match(/<text[^>]*>([\s\S]*?)<\/text>/g) || [];
-          if (xmlParts.length) {
-            const transcript = xmlParts
+          const parts = text.match(/<text[^>]*>([\s\S]*?)<\/text>/g) || [];
+          if (parts.length) {
+            const transcript = parts
               .map((t) =>
                 t.replace(/<[^>]+>/g, "")
                   .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-                  .replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\n/g, " ").trim()
+                  .replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+                  .replace(/\n/g, " ").trim()
               )
               .filter(Boolean)
               .join(" ");
@@ -79,7 +139,7 @@ function fetchTranscriptViaXHRIntercept() {
       return origSend.apply(this, args);
     };
 
-    // Trigger YouTube to load captions (this causes the XHR with pot= token)
+    // Trigger YouTube to load captions (causes XHR with pot= token)
     try {
       const player = document.getElementById("movie_player");
       if (!player) { finish({ error: "no_player" }); return; }
@@ -95,10 +155,7 @@ function fetchTranscriptViaXHRIntercept() {
         pick("en") || pick("ru") || pick("uk") ||
         tracks[0];
 
-      // Save current CC state so we can restore it after
       window.__ytExtPrevTrack = player.getOption("captions", "track");
-
-      // Force-reload: turn off then switch to target language — triggers new XHR
       player.setOption("captions", "track", {});
       setTimeout(() => {
         if (!done) player.setOption("captions", "track", { languageCode: track.languageCode });
@@ -108,6 +165,8 @@ function fetchTranscriptViaXHRIntercept() {
     }
   });
 }
+
+// ── Main flow ─────────────────────────────────────────────────────────────────
 
 async function run() {
   const btn = document.getElementById("btnSummarize");
@@ -144,7 +203,7 @@ async function run() {
     return;
   }
 
-  // Step 2: intercept YouTube's own XHR for captions (has pot= token)
+  // Step 2: intercept YouTube's own XHR (has pot= token, full video transcript)
   setStatus('<span class="loader"></span> Loading captions...');
 
   let transcript = null;
@@ -164,7 +223,7 @@ async function run() {
     console.log("[yt-ext] executeScript error:", e.message);
   }
 
-  // Step 3: fallback — background.js methods
+  // Step 3: fallback — background.js
   if (!transcript) {
     setStatus('<span class="loader"></span> Trying fallback...');
     const bgResult = await new Promise((resolve) => {
@@ -181,6 +240,8 @@ async function run() {
     }
   }
 
+  // Save to history + storage
+  await saveToHistory(videoInfo.videoId, videoInfo.title, transcript);
   const prompt = buildPrompt(videoInfo.title, transcript);
   await chrome.storage.local.set({ yt_prompt: prompt, yt_title: videoInfo.title });
 
@@ -203,4 +264,14 @@ function buildPrompt(title, transcript) {
 ${transcript.slice(0, 14000)}`;
 }
 
+// ── Init ──────────────────────────────────────────────────────────────────────
+
 document.getElementById("btnSummarize").addEventListener("click", run);
+
+document.getElementById("btnClearHistory").addEventListener("click", async () => {
+  await chrome.storage.local.remove("yt_history");
+  renderHistory([]);
+});
+
+// Load history on popup open
+loadHistory().then(renderHistory);
