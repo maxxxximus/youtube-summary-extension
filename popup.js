@@ -1,4 +1,80 @@
-const PROMPT_TEMPLATE = (title, transcript) => `Please summarize the following YouTube video.
+function setStatus(msg, type = "") {
+  const el = document.getElementById("status");
+  el.className = type;
+  el.innerHTML = msg;
+}
+
+async function getCurrentTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function run() {
+  const btn = document.getElementById("btnSummarize");
+  btn.disabled = true;
+  setStatus('<span class="loader"></span> Getting video info...');
+
+  const tab = await getCurrentTab();
+
+  if (!tab.url || !tab.url.includes("youtube.com/watch")) {
+    setStatus("⚠️ Open a YouTube video first!", "error");
+    btn.disabled = false;
+    return;
+  }
+
+  // Step 1: Get video ID from content script
+  let videoInfo;
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] }).catch(() => {});
+    videoInfo = await new Promise((resolve, reject) => {
+      chrome.tabs.sendMessage(tab.id, { action: "getVideoInfo" }, res => {
+        if (chrome.runtime.lastError || !res) reject(new Error("Could not connect. Refresh the page."));
+        else resolve(res);
+      });
+    });
+  } catch (e) {
+    setStatus("❌ " + e.message, "error");
+    btn.disabled = false;
+    return;
+  }
+
+  if (videoInfo.error) {
+    setStatus("❌ " + videoInfo.error, "error");
+    btn.disabled = false;
+    return;
+  }
+
+  setStatus('<span class="loader"></span> Fetching transcript...');
+
+  // Step 2: Ask background.js to fetch transcript (bypasses Brave Shields)
+  const result = await new Promise(resolve => {
+    chrome.runtime.sendMessage(
+      { action: "fetchTranscript", videoId: videoInfo.videoId },
+      res => resolve(res || { error: "No response from background." })
+    );
+  });
+
+  if (result.error) {
+    setStatus("❌ " + result.error, "error");
+    btn.disabled = false;
+    return;
+  }
+
+  // Step 3: Save to storage and open relay page
+  const prompt = buildPrompt(result.title, result.transcript);
+  await chrome.storage.local.set({ yt_prompt: prompt, yt_title: result.title });
+
+  setStatus("✅ Done! Opening prompt page...", "success");
+
+  setTimeout(() => {
+    chrome.tabs.create({ url: chrome.runtime.getURL("relay.html") });
+  }, 500);
+
+  btn.disabled = false;
+}
+
+function buildPrompt(title, transcript) {
+  return `Please summarize the following YouTube video.
 
 **Video title:** ${title}
 
@@ -8,114 +84,7 @@ const PROMPT_TEMPLATE = (title, transcript) => `Please summarize the following Y
 - Keep it clear and easy to understand
 
 **Transcript:**
-${transcript.slice(0, 12000)}`;
-
-function setStatus(msg, type = "") {
-  const el = document.getElementById("status");
-  el.className = type;
-  el.innerHTML = msg;
+${transcript.slice(0, 14000)}`;
 }
 
-async function getTranscriptFromTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-  if (!tab.url || !tab.url.includes("youtube.com/watch")) {
-    setStatus("⚠️ Open a YouTube video first!", "error");
-    return null;
-  }
-
-  // Inject content script fresh every time (safe with duplicate guard)
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ["content.js"]
-    });
-  } catch (e) { /* already injected */ }
-
-  // Small delay to ensure script is ready
-  await new Promise(r => setTimeout(r, 200));
-
-  return new Promise(resolve => {
-    chrome.tabs.sendMessage(tab.id, { action: "getTranscript" }, response => {
-      if (chrome.runtime.lastError || !response) {
-        setStatus("❌ Could not connect. Refresh the YouTube page and try again.", "error");
-        resolve(null);
-      } else {
-        resolve(response);
-      }
-    });
-  });
-}
-
-// Copy text using a hidden textarea (more reliable than clipboard API in extensions)
-function copyToClipboard(text) {
-  return new Promise((resolve) => {
-    navigator.clipboard.writeText(text).then(resolve).catch(() => {
-      // Fallback: textarea trick
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand("copy");
-        resolve();
-      } catch (e) {
-        resolve();
-      }
-      document.body.removeChild(ta);
-    });
-  });
-}
-
-// ✨ Summarize with ChatGPT
-document.getElementById("btnChatGPT").addEventListener("click", async () => {
-  const btn = document.getElementById("btnChatGPT");
-  btn.disabled = true;
-  setStatus('<span class="loader"></span> Extracting transcript...');
-
-  const result = await getTranscriptFromTab();
-  if (!result) { btn.disabled = false; return; }
-  if (result.error) {
-    setStatus("❌ " + result.error, "error");
-    btn.disabled = false;
-    return;
-  }
-
-  setStatus('<span class="loader"></span> Copying prompt...');
-  const prompt = PROMPT_TEMPLATE(result.title, result.transcript);
-
-  await copyToClipboard(prompt);
-
-  // Store in localStorage as backup
-  try { localStorage.setItem("yt_summary_prompt", prompt); } catch(e){}
-
-  setStatus("✅ Done! ChatGPT is opening...<br><b>Press Ctrl+V (or ⌘+V) to paste!</b>", "success");
-
-  // Small delay so user sees the message before popup closes
-  setTimeout(() => {
-    chrome.tabs.create({ url: "https://chatgpt.com/" });
-  }, 800);
-
-  btn.disabled = false;
-});
-
-// 📋 Copy transcript only
-document.getElementById("btnCopy").addEventListener("click", async () => {
-  const btn = document.getElementById("btnCopy");
-  btn.disabled = true;
-  setStatus('<span class="loader"></span> Extracting transcript...');
-
-  const result = await getTranscriptFromTab();
-  if (!result) { btn.disabled = false; return; }
-  if (result.error) {
-    setStatus("❌ " + result.error, "error");
-    btn.disabled = false;
-    return;
-  }
-
-  await copyToClipboard(result.transcript);
-  setStatus("✅ Transcript copied to clipboard!", "success");
-  btn.disabled = false;
-});
+document.getElementById("btnSummarize").addEventListener("click", run);
