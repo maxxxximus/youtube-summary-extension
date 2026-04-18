@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Summary → ChatGPT",
+  "version": "1.0",
+  "description": "Extract YouTube transcript and summarize with ChatGPT for free",
+  "permissions": ["activeTab", "scripting", "clipboardWrite"],
+  "host_permissions": ["https://www.youtube.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}
