@@ -62,7 +62,7 @@ async function tryFromPageHTML(videoId) {
 
 // --- Method 2: YouTube timedtext API (simpler, no page parsing) ---
 async function tryTimedtextAPI(videoId) {
-  const languages = ["en", "uk", "ru"];
+  const languages = ["en", "ru", "uk", "de", "fr", "es", "it", "pl"];
   for (const lang of languages) {
     try {
       const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=json3`;
@@ -85,9 +85,10 @@ async function tryTimedtextAPI(videoId) {
     }
   }
 
-  // Also try auto-generated (asr)
-  try {
-    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=json3`;
+  // Also try auto-generated (asr) for multiple languages
+  for (const lang of ["en", "ru", "uk"]) {
+    try {
+      const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&kind=asr&fmt=json3`;
     const res = await fetch(url);
     if (res.ok) {
       const data = await res.json();
@@ -101,8 +102,8 @@ async function tryTimedtextAPI(videoId) {
           .trim();
         if (transcript.length > 50) return transcript;
       }
-    }
-  } catch {}
+    } catch { continue; }
+  }
 
   return null;
 }
