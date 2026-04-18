@@ -83,7 +83,9 @@ async function run() {
       func: extractCaptionUrl,
     });
     videoInfo.captionUrl = results?.[0]?.result ?? null;
-  } catch (_) {
+    console.log("[yt-ext] captionUrl from MAIN world:", videoInfo.captionUrl ? videoInfo.captionUrl.slice(0, 80) : null);
+  } catch (e) {
+    console.log("[yt-ext] MAIN world executeScript error:", e.message);
     videoInfo.captionUrl = null;
   }
 
