@@ -212,5 +212,7 @@ function parseXML(xml) {
 function fetchWith(url, ms = TIMEOUT_MS, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
-  return fetch(url, { signal: controller.signal, ...options }).finally(() => clearTimeout(timer));
+  // credentials:'include' sends YouTube session cookies from the browser —
+  // required for timedtext API and signed caption URLs to return data
+  return fetch(url, { signal: controller.signal, credentials: "include", ...options }).finally(() => clearTimeout(timer));
 }

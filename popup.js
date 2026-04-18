@@ -89,7 +89,8 @@ async function run() {
     videoInfo.captionUrl = null;
   }
 
-  setStatus('<span class="loader"></span> Fetching transcript...');
+  const urlHint = videoInfo.captionUrl ? "captionUrl ✓" : "no captionUrl, fallback";
+  setStatus(`<span class="loader"></span> Fetching transcript (${urlHint})...`);
 
   // Step 3: Ask background.js to fetch the transcript
   const result = await new Promise(resolve => {
