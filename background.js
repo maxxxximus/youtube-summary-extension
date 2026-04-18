@@ -1,60 +1,129 @@
 // background.js — runs as service worker, NOT subject to Brave Shields or page CSP
-// All YouTube fetches happen here → works in Brave, Firefox, Chrome
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "fetchTranscript") {
     fetchTranscript(request.videoId)
       .then(result => sendResponse(result))
       .catch(err => sendResponse({ error: err.message }));
-    return true; // Keep message channel open for async
+    return true;
   }
 });
 
 async function fetchTranscript(videoId) {
-  // Fetch YouTube page from background (bypasses Brave Shields)
-  const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9"
-    }
-  });
+  const title = await getTitle(videoId);
 
-  if (!res.ok) throw new Error(`YouTube returned ${res.status}`);
-  const html = await res.text();
+  // Try Method 1: parse captionTracks from YouTube page HTML
+  let transcript = await tryFromPageHTML(videoId);
 
-  // Extract video title
-  const titleMatch = html.match(/<title>(.*?)<\/title>/);
-  const title = titleMatch
-    ? titleMatch[1].replace(" - YouTube", "").replace(/&amp;/g, "&").trim()
-    : "YouTube Video";
-
-  // Extract caption tracks
-  const captionsMatch = html.match(/"captionTracks":(\[.*?\])/);
-  if (!captionsMatch) throw new Error("No transcript available for this video.");
-
-  let captionTracks;
-  try {
-    captionTracks = JSON.parse(captionsMatch[1]);
-  } catch {
-    throw new Error("Could not parse caption data.");
+  // Try Method 2: YouTube timedtext API (direct, no page parsing needed)
+  if (!transcript) {
+    transcript = await tryTimedtextAPI(videoId);
   }
 
-  if (!captionTracks.length) throw new Error("No transcript available for this video.");
+  if (!transcript) {
+    throw new Error("No transcript found. The video may not have subtitles/captions enabled.");
+  }
 
-  // Pick best track: English → Ukrainian → any auto-generated → first available
-  const track =
-    captionTracks.find(t => t.languageCode === "en" && !t.kind) ||
-    captionTracks.find(t => t.languageCode === "en") ||
-    captionTracks.find(t => t.languageCode === "uk") ||
-    captionTracks.find(t => t.kind === "asr") ||
-    captionTracks[0];
+  return { transcript, title };
+}
 
-  // Fetch caption XML
-  const captionRes = await fetch(track.baseUrl);
-  if (!captionRes.ok) throw new Error("Could not fetch transcript data.");
-  const xml = await captionRes.text();
+// --- Method 1: extract captionTracks from YouTube page ---
+async function tryFromPageHTML(videoId) {
+  try {
+    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      }
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
 
-  // Parse XML → plain text
+    // [\s\S] matches newlines too — fixes multiline captionTracks
+    const match = html.match(/"captionTracks":(\[[\s\S]*?\])/);
+    if (!match) return null;
+
+    // YouTube sometimes has trailing commas or broken JSON — clean it up
+    let json = match[1];
+    // Trim at the last valid closing bracket
+    const lastBracket = json.lastIndexOf("]");
+    json = json.slice(0, lastBracket + 1);
+
+    const tracks = JSON.parse(json);
+    if (!tracks.length) return null;
+
+    const track = pickBestTrack(tracks);
+    return await fetchCaptionXML(track.baseUrl);
+  } catch {
+    return null;
+  }
+}
+
+// --- Method 2: YouTube timedtext API (simpler, no page parsing) ---
+async function tryTimedtextAPI(videoId) {
+  const languages = ["en", "uk", "ru"];
+  for (const lang of languages) {
+    try {
+      const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=json3`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!data.events || !data.events.length) continue;
+
+      const transcript = data.events
+        .filter(e => e.segs)
+        .flatMap(e => e.segs.map(s => s.utf8 || ""))
+        .join(" ")
+        .replace(/\n/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (transcript.length > 50) return transcript;
+    } catch {
+      continue;
+    }
+  }
+
+  // Also try auto-generated (asr)
+  try {
+    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=json3`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.events?.length) {
+        const transcript = data.events
+          .filter(e => e.segs)
+          .flatMap(e => e.segs.map(s => s.utf8 || ""))
+          .join(" ")
+          .replace(/\n/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (transcript.length > 50) return transcript;
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+// --- Helpers ---
+
+function pickBestTrack(tracks) {
+  return (
+    tracks.find(t => t.languageCode === "en" && !t.kind) ||
+    tracks.find(t => t.languageCode === "en") ||
+    tracks.find(t => t.languageCode === "uk") ||
+    tracks.find(t => t.kind === "asr") ||
+    tracks[0]
+  );
+}
+
+async function fetchCaptionXML(url) {
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const xml = await res.text();
+
   const texts = xml.match(/<text[^>]*>([\s\S]*?)<\/text>/g) || [];
   const transcript = texts
     .map(t => t.replace(/<[^>]+>/g, ""))
@@ -70,7 +139,18 @@ async function fetchTranscript(videoId) {
     .filter(Boolean)
     .join(" ");
 
-  if (!transcript) throw new Error("Transcript is empty.");
+  return transcript.length > 50 ? transcript : null;
+}
 
-  return { transcript, title };
+async function getTitle(videoId) {
+  try {
+    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9" }
+    });
+    const html = await res.text();
+    const m = html.match(/<title>(.*?)<\/title>/);
+    return m ? m[1].replace(" - YouTube", "").replace(/&amp;/g, "&").trim() : "YouTube Video";
+  } catch {
+    return "YouTube Video";
+  }
 }
