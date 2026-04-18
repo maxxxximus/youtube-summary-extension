@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Summary → ChatGPT",
-  "version": "2.1",
+  "version": "2.5",
   "description": "Extract YouTube transcript and summarize with ChatGPT. Works in Chrome, Brave, Firefox.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
