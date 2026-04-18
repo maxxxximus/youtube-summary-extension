@@ -9,12 +9,14 @@ async function getCurrentTab() {
   return tab;
 }
 
-// Runs in MAIN world — bypasses YouTube's CSP that blocks inline scripts
-function extractCaptionUrl() {
+// Runs in YouTube's MAIN world via executeScript.
+// Fetches the caption XML directly from the page context — same-origin request,
+// cookies included automatically. Bypasses both CSP and background cookie issues.
+async function fetchTranscriptInPage() {
   try {
     let data = window.ytInitialPlayerResponse;
 
-    // On SPA navigation ytInitialPlayerResponse may be stale — try ytplayer.config too
+    // SPA navigation: ytInitialPlayerResponse may be stale, try ytplayer.config
     if (!data?.captions) {
       const raw = window.ytplayer?.config?.args?.raw_player_response;
       if (raw) {
@@ -23,7 +25,7 @@ function extractCaptionUrl() {
     }
 
     const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-    if (!tracks.length) return null;
+    if (!tracks.length) return { error: "no_tracks" };
 
     const manual = (lang) => tracks.find(t => t.languageCode === lang && !t.kind);
     const any    = (lang) => tracks.find(t => t.languageCode === lang);
@@ -33,9 +35,32 @@ function extractCaptionUrl() {
       tracks.find(t => t.kind === "asr") ||
       tracks[0];
 
-    return track?.baseUrl || null;
-  } catch (_) {
-    return null;
+    if (!track?.baseUrl) return { error: "no_baseUrl" };
+
+    // Same-origin fetch — YouTube cookies sent automatically, no CORS issues
+    const res = await fetch(track.baseUrl);
+    if (!res.ok) return { error: `fetch_${res.status}` };
+    const xml = await res.text();
+
+    // Parse XML with DOMParser (available in page context)
+    const doc = new DOMParser().parseFromString(xml, "text/xml");
+    const textEls = Array.from(doc.querySelectorAll("text"));
+    if (!textEls.length) return { error: "empty_xml" };
+
+    const transcript = textEls
+      .map(el => (el.textContent || "")
+        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+        .replace(/\n/g, " ").trim()
+      )
+      .filter(Boolean)
+      .join(" ");
+
+    return transcript.length > 50
+      ? { transcript }
+      : { error: "too_short" };
+  } catch (e) {
+    return { error: e.message };
   }
 }
 
@@ -52,7 +77,7 @@ async function run() {
     return;
   }
 
-  // Step 1: Get videoId + title from content script (isolated world — safe for DOM/URL)
+  // Step 1: Get videoId + title from content script (isolated world)
   let videoInfo;
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] }).catch(() => {});
@@ -74,44 +99,51 @@ async function run() {
     return;
   }
 
-  // Step 2: Extract captionUrl from page context (MAIN world — reads ytInitialPlayerResponse)
-  // This bypasses YouTube's CSP which blocks inline scripts injected by content scripts
+  // Step 2: Fetch transcript directly in YouTube's MAIN world.
+  // This is the primary method — same-origin fetch uses YouTube cookies automatically.
+  setStatus('<span class="loader"></span> Fetching transcript...');
+
+  let transcript = null;
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: "MAIN",
-      func: extractCaptionUrl,
+      func: fetchTranscriptInPage,
     });
-    videoInfo.captionUrl = results?.[0]?.result ?? null;
-    console.log("[yt-ext] captionUrl from MAIN world:", videoInfo.captionUrl ? videoInfo.captionUrl.slice(0, 80) : null);
+    const pageResult = results?.[0]?.result;
+    if (pageResult?.transcript) {
+      transcript = pageResult.transcript;
+      console.log("[yt-ext] MAIN world success, len=", transcript.length);
+    } else {
+      console.log("[yt-ext] MAIN world failed:", pageResult?.error);
+    }
   } catch (e) {
     console.log("[yt-ext] MAIN world executeScript error:", e.message);
-    videoInfo.captionUrl = null;
   }
 
-  const urlHint = videoInfo.captionUrl ? "captionUrl ✓" : "no captionUrl, fallback";
-  setStatus(`<span class="loader"></span> Fetching transcript (${urlHint})...`);
-
-  // Step 3: Ask background.js to fetch the transcript
-  const result = await new Promise(resolve => {
-    chrome.runtime.sendMessage(
-      { action: "fetchTranscript", videoId: videoInfo.videoId, captionUrl: videoInfo.captionUrl },
-      res => resolve(res || { error: "No response from background." })
-    );
-  });
-
-  if (result.error) {
-    setStatus("❌ " + result.error, "error");
-    btn.disabled = false;
-    return;
+  // Step 3: Fallback — background.js (timedtext API + innertube + page HTML)
+  if (!transcript) {
+    setStatus('<span class="loader"></span> Trying fallback methods...');
+    const bgResult = await new Promise(resolve => {
+      chrome.runtime.sendMessage(
+        { action: "fetchTranscript", videoId: videoInfo.videoId, captionUrl: null },
+        res => resolve(res || { error: "No response from background." })
+      );
+    });
+    if (bgResult.transcript) {
+      transcript = bgResult.transcript;
+    } else {
+      setStatus("❌ " + (bgResult.error || "No transcript found."), "error");
+      btn.disabled = false;
+      return;
+    }
   }
 
-  // Step 4: Save to storage and open relay page
-  const prompt = buildPrompt(videoInfo.title, result.transcript);
+  // Step 4: Save and open relay page
+  const prompt = buildPrompt(videoInfo.title, transcript);
   await chrome.storage.local.set({ yt_prompt: prompt, yt_title: videoInfo.title });
 
   setStatus("✅ Done! Opening prompt page...", "success");
-
   setTimeout(() => {
     chrome.tabs.create({ url: chrome.runtime.getURL("relay.html") });
   }, 500);
