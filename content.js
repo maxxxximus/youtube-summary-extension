@@ -1,5 +1,6 @@
-// content.js — runs inside YouTube page (has cookies + session)
-// Extracts caption URL directly from the page data
+// content.js — runs inside YouTube page
+// Content scripts are ISOLATED from page JS context,
+// so we inject a script tag into the page to read ytInitialPlayerResponse
 
 if (!window.__ytSummaryInjected) {
   window.__ytSummaryInjected = true;
@@ -19,53 +20,61 @@ async function getVideoInfo() {
 
   if (!videoId) return { error: "No YouTube video found. Open a video first!" };
 
-  // --- Method 1: extract captionTracks from ytInitialPlayerResponse ---
-  try {
-    const scripts = Array.from(document.querySelectorAll("script"));
-    for (const script of scripts) {
-      const text = script.textContent;
-      if (!text.includes("captionTracks")) continue;
+  // Inject script into PAGE context to access ytInitialPlayerResponse
+  const captionUrl = await getCaptionUrlFromPage();
 
-      const match = text.match(/"captionTracks":(\[[\s\S]*?\])/);
-      if (!match) continue;
-
-      let json = match[1];
-      json = json.slice(0, json.lastIndexOf("]") + 1);
-      const tracks = JSON.parse(json);
-      if (!tracks.length) continue;
-
-      const track = pickBestTrack(tracks);
-      if (track?.baseUrl) {
-        return { videoId, title, captionUrl: track.baseUrl };
-      }
-    }
-  } catch {}
-
-  // --- Method 2: try window.ytInitialPlayerResponse ---
-  try {
-    const data = window.ytInitialPlayerResponse;
-    const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    if (tracks?.length) {
-      const track = pickBestTrack(tracks);
-      if (track?.baseUrl) {
-        return { videoId, title, captionUrl: track.baseUrl };
-      }
-    }
-  } catch {}
-
-  // No caption URL found — pass videoId so background can try timedtext API
-  return { videoId, title, captionUrl: null };
+  return { videoId, title, captionUrl };
 }
 
-function pickBestTrack(tracks) {
-  return (
-    tracks.find(t => t.languageCode === "en" && !t.kind) ||
-    tracks.find(t => t.languageCode === "ru" && !t.kind) ||
-    tracks.find(t => t.languageCode === "uk" && !t.kind) ||
-    tracks.find(t => t.languageCode === "en") ||
-    tracks.find(t => t.languageCode === "ru") ||
-    tracks.find(t => t.languageCode === "uk") ||
-    tracks.find(t => t.kind === "asr") ||
-    tracks[0]
-  );
+function getCaptionUrlFromPage() {
+  return new Promise((resolve) => {
+    // Listen for response from injected script
+    const handler = (e) => {
+      if (e.data?.type === "YT_CAPTION_URL") {
+        window.removeEventListener("message", handler);
+        resolve(e.data.url || null);
+      }
+    };
+    window.addEventListener("message", handler);
+
+    // Timeout fallback
+    setTimeout(() => {
+      window.removeEventListener("message", handler);
+      resolve(null);
+    }, 3000);
+
+    // Inject script into page context (has access to window.ytInitialPlayerResponse)
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        try {
+          const data = window.ytInitialPlayerResponse;
+          const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+
+          if (!tracks.length) {
+            window.postMessage({ type: "YT_CAPTION_URL", url: null }, "*");
+            return;
+          }
+
+          // Pick best track
+          const pick = (lang, kind) => tracks.find(t => t.languageCode === lang && (kind === undefined || !t.kind));
+          const track =
+            pick("en", "manual") ||
+            pick("ru", "manual") ||
+            pick("uk", "manual") ||
+            tracks.find(t => t.languageCode === "en") ||
+            tracks.find(t => t.languageCode === "ru") ||
+            tracks.find(t => t.languageCode === "uk") ||
+            tracks.find(t => t.kind === "asr") ||
+            tracks[0];
+
+          window.postMessage({ type: "YT_CAPTION_URL", url: track?.baseUrl || null }, "*");
+        } catch(e) {
+          window.postMessage({ type: "YT_CAPTION_URL", url: null }, "*");
+        }
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove();
+  });
 }
