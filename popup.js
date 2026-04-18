@@ -9,59 +9,104 @@ async function getCurrentTab() {
   return tab;
 }
 
-// Runs in YouTube's MAIN world via executeScript.
-// Fetches the caption XML directly from the page context — same-origin request,
-// cookies included automatically. Bypasses both CSP and background cookie issues.
-async function fetchTranscriptInPage() {
-  try {
-    let data = window.ytInitialPlayerResponse;
+// Runs in YouTube's MAIN world.
+// Intercepts the XHR that YouTube itself makes when loading CC subtitles —
+// that XHR has the signed pot= token attached by the player automatically.
+// We trigger the caption load via player.setOption(), capture the response,
+// then restore everything. This is the only reliable method because the pot
+// token is generated dynamically by YouTube's player scripts at request time.
+function fetchTranscriptViaXHRIntercept() {
+  return new Promise((resolve) => {
+    let done = false;
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
 
-    // SPA navigation: ytInitialPlayerResponse may be stale, try ytplayer.config
-    if (!data?.captions) {
-      const raw = window.ytplayer?.config?.args?.raw_player_response;
-      if (raw) {
-        try { data = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) {}
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      XMLHttpRequest.prototype.open = origOpen;
+      XMLHttpRequest.prototype.send = origSend;
+      clearTimeout(timer);
+      // Restore player CC state to what it was before
+      try {
+        const player = document.getElementById("movie_player");
+        if (player) player.setOption("captions", "track", window.__ytExtPrevTrack || {});
+      } catch (_) {}
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => finish({ error: "timeout" }), 12000);
+
+    // Intercept XHR — capture timedtext responses
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      this._isTimedtext = typeof url === "string" && url.includes("/api/timedtext");
+      return origOpen.apply(this, [method, url, ...rest]);
+    };
+
+    XMLHttpRequest.prototype.send = function (...args) {
+      if (this._isTimedtext) {
+        this.addEventListener("load", function () {
+          const text = this.responseText;
+          if (!text || text.length < 100) return; // skip empty / tiny responses
+
+          // JSON3 format (fmt=json3)
+          try {
+            const data = JSON.parse(text);
+            const transcript = (data.events || [])
+              .filter((e) => e.segs)
+              .flatMap((e) => e.segs.map((s) => s.utf8 || ""))
+              .join(" ")
+              .replace(/\s+/g, " ")
+              .trim();
+            if (transcript.length > 50) { finish({ transcript }); return; }
+          } catch (_) {}
+
+          // XML format fallback
+          const xmlParts = text.match(/<text[^>]*>([\s\S]*?)<\/text>/g) || [];
+          if (xmlParts.length) {
+            const transcript = xmlParts
+              .map((t) =>
+                t.replace(/<[^>]+>/g, "")
+                  .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+                  .replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\n/g, " ").trim()
+              )
+              .filter(Boolean)
+              .join(" ");
+            if (transcript.length > 50) { finish({ transcript }); return; }
+          }
+        });
       }
+      return origSend.apply(this, args);
+    };
+
+    // Trigger YouTube to load captions (this causes the XHR with pot= token)
+    try {
+      const player = document.getElementById("movie_player");
+      if (!player) { finish({ error: "no_player" }); return; }
+
+      const resp = player.getPlayerResponse();
+      const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+      if (!tracks.length) { finish({ error: "no_tracks" }); return; }
+
+      const pick = (lang, manual) =>
+        tracks.find((t) => t.languageCode === lang && (manual ? !t.kind : true));
+      const track =
+        pick("en", true) || pick("ru", true) || pick("uk", true) ||
+        pick("en") || pick("ru") || pick("uk") ||
+        tracks[0];
+
+      // Save current CC state so we can restore it after
+      window.__ytExtPrevTrack = player.getOption("captions", "track");
+
+      // Force-reload: turn off then switch to target language — triggers new XHR
+      player.setOption("captions", "track", {});
+      setTimeout(() => {
+        if (!done) player.setOption("captions", "track", { languageCode: track.languageCode });
+      }, 150);
+    } catch (e) {
+      finish({ error: "player_error: " + e.message });
     }
-
-    const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-    if (!tracks.length) return { error: "no_tracks" };
-
-    const manual = (lang) => tracks.find(t => t.languageCode === lang && !t.kind);
-    const any    = (lang) => tracks.find(t => t.languageCode === lang);
-    const track  =
-      manual("en") || manual("ru") || manual("uk") ||
-      any("en") || any("ru") || any("uk") ||
-      tracks.find(t => t.kind === "asr") ||
-      tracks[0];
-
-    if (!track?.baseUrl) return { error: "no_baseUrl" };
-
-    // Same-origin fetch — YouTube cookies sent automatically, no CORS issues
-    const res = await fetch(track.baseUrl);
-    if (!res.ok) return { error: `fetch_${res.status}` };
-    const xml = await res.text();
-
-    // Parse XML with DOMParser (available in page context)
-    const doc = new DOMParser().parseFromString(xml, "text/xml");
-    const textEls = Array.from(doc.querySelectorAll("text"));
-    if (!textEls.length) return { error: "empty_xml" };
-
-    const transcript = textEls
-      .map(el => (el.textContent || "")
-        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-        .replace(/&#39;/g, "'").replace(/&quot;/g, '"')
-        .replace(/\n/g, " ").trim()
-      )
-      .filter(Boolean)
-      .join(" ");
-
-    return transcript.length > 50
-      ? { transcript }
-      : { error: "too_short" };
-  } catch (e) {
-    return { error: e.message };
-  }
+  });
 }
 
 async function run() {
@@ -77,12 +122,12 @@ async function run() {
     return;
   }
 
-  // Step 1: Get videoId + title from content script (isolated world)
+  // Step 1: videoId + title from isolated-world content script
   let videoInfo;
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] }).catch(() => {});
     videoInfo = await new Promise((resolve, reject) => {
-      chrome.tabs.sendMessage(tab.id, { action: "getVideoInfo" }, res => {
+      chrome.tabs.sendMessage(tab.id, { action: "getVideoInfo" }, (res) => {
         if (chrome.runtime.lastError || !res) reject(new Error("Could not connect. Refresh the page."));
         else resolve(res);
       });
@@ -99,55 +144,48 @@ async function run() {
     return;
   }
 
-  // Step 2: Fetch transcript directly in YouTube's MAIN world.
-  // This is the primary method — same-origin fetch uses YouTube cookies automatically.
-  setStatus('<span class="loader"></span> Fetching transcript...');
+  // Step 2: intercept YouTube's own XHR for captions (has pot= token)
+  setStatus('<span class="loader"></span> Loading captions...');
 
   let transcript = null;
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: "MAIN",
-      func: fetchTranscriptInPage,
+      func: fetchTranscriptViaXHRIntercept,
     });
-    const pageResult = results?.[0]?.result;
-    if (pageResult?.transcript) {
-      transcript = pageResult.transcript;
-      console.log("[yt-ext] MAIN world success, len=", transcript.length);
+    const r = results?.[0]?.result;
+    if (r?.transcript) {
+      transcript = r.transcript;
     } else {
-      console.log("[yt-ext] MAIN world failed:", pageResult?.error);
+      console.log("[yt-ext] XHR intercept failed:", r?.error);
     }
   } catch (e) {
-    console.log("[yt-ext] MAIN world executeScript error:", e.message);
+    console.log("[yt-ext] executeScript error:", e.message);
   }
 
-  // Step 3: Fallback — background.js (timedtext API + innertube + page HTML)
+  // Step 3: fallback — background.js methods
   if (!transcript) {
-    setStatus('<span class="loader"></span> Trying fallback methods...');
-    const bgResult = await new Promise(resolve => {
+    setStatus('<span class="loader"></span> Trying fallback...');
+    const bgResult = await new Promise((resolve) => {
       chrome.runtime.sendMessage(
         { action: "fetchTranscript", videoId: videoInfo.videoId, captionUrl: null },
-        res => resolve(res || { error: "No response from background." })
+        (res) => resolve(res || { error: "No response from background." })
       );
     });
-    if (bgResult.transcript) {
-      transcript = bgResult.transcript;
-    } else {
+    transcript = bgResult.transcript || null;
+    if (!transcript) {
       setStatus("❌ " + (bgResult.error || "No transcript found."), "error");
       btn.disabled = false;
       return;
     }
   }
 
-  // Step 4: Save and open relay page
   const prompt = buildPrompt(videoInfo.title, transcript);
   await chrome.storage.local.set({ yt_prompt: prompt, yt_title: videoInfo.title });
 
   setStatus("✅ Done! Opening prompt page...", "success");
-  setTimeout(() => {
-    chrome.tabs.create({ url: chrome.runtime.getURL("relay.html") });
-  }, 500);
-
+  setTimeout(() => chrome.tabs.create({ url: chrome.runtime.getURL("relay.html") }), 500);
   btn.disabled = false;
 }
 
